@@ -183,6 +183,7 @@ class BeautifulSoup(Tag):
     known_xml: Optional[bool]
     parse_only: Optional[SoupStrainer]  #: :meta private:
     replacer: Optional[SoupReplacer]  #: :meta private:
+    _renamed_tags: Dict[int, str]  #: :meta private:
 
     # These members are only used while parsing markup.
     markup: Optional[_RawMarkup]  #: :meta private:
@@ -259,10 +260,15 @@ class BeautifulSoup(Tag):
          built. This is useful for subclassing Tag or NavigableString
          to modify default behavior.
 
-        :param replacer: A SoupReplacer. Every tag whose name matches the
+        :param replacer(M2): A SoupReplacer. Every tag whose name matches the
          replacer's ``og_tag`` is given the name ``alt_tag`` while the
          document is being parsed, so no second pass over the tree is
          needed.
+
+         :param replacer(M3): A SoupReplacer. Each tag is renamed and/or given
+         new attributes by the replacer (and may be modified by its
+         transformer functions) as the tag is created while the document
+         is being parsed, so no second pass over the tree is needed.
 
         :param kwargs: For backwards compatibility purposes, the
          constructor accepts certain keyword arguments used in
@@ -672,6 +678,7 @@ class BeautifulSoup(Tag):
             self.currentTag is not None and self.currentTag.name != self.ROOT_TAG_NAME
         ):
             self.popTag()
+        self._renamed_tags.clear()
 
     def reset(self) -> None:
         """Reset this object to a state as though it had never parsed any
@@ -684,6 +691,8 @@ class BeautifulSoup(Tag):
         self.currentTag = None
         self.tagStack = []
         self.open_tag_counter = Counter()
+        # Tags renamed by a SoupReplacer: id(tag) -> name in the document.
+        self._renamed_tags = {}
         self.preserve_whitespace_tag_stack = []
         self.string_container_stack = []
         self._most_recent_element = None
@@ -994,6 +1003,81 @@ class BeautifulSoup(Tag):
 
         return most_recently_popped
 
+    def _popToSourceTag(
+            self, name: str, nsprefix: Optional[str] = None
+    ) -> Optional[Tag]:
+        """Like _popToTag, but `name` is the name the tag had in the
+        *document*. Used when a SoupReplacer may have renamed tags, so
+        that `</b>` still closes the tag that `<b>` opened even though
+        that tag is now called "blockquote".
+
+        :param name: Pop up to the most recent tag that had this name in
+          the document.
+        :param nsprefix: The namespace prefix that goes with `name`.
+
+        :meta private:
+        """
+        if name == self.ROOT_TAG_NAME:
+            return None
+
+        for i in range(len(self.tagStack) - 1, 0, -1):
+            t = self.tagStack[i]
+            source_name = self._renamed_tags.get(id(t), t.name)
+            if source_name == name and nsprefix == t.prefix:
+                most_recently_popped = None
+                while len(self.tagStack) > i:
+                    most_recently_popped = self.popTag()
+                return most_recently_popped
+        return None
+
+    def _apply_replacer(self, tag: Tag) -> None:
+        """Let the SoupReplacer transform a tag that was just created.
+
+        This runs before the tag is pushed onto the tag stack, because
+        pushTag and popTag keep their counters by tag name.
+
+        :meta private:
+        """
+        replacer = self.replacer
+        if replacer is None:
+            return
+        source_name = tag.name
+
+        # name_xformer and attrs_xformer both see the tag as it was in
+        # the document, so compute both before changing anything.
+        new_name = replacer.get_new_name(tag)
+        new_attrs = replacer.get_new_attrs(tag)
+
+        if new_name is not None:
+            tag.name = new_name
+        if new_attrs is not None:
+            attrs = self.builder.attribute_dict_class()
+            for key, value in new_attrs.items():
+                # Store lists in new lists, as Tag.__init__ does.
+                attrs[key] = value.__class__(value) if isinstance(value, list) else value
+            # "class" and friends are lists in HTML: split "a b" into
+            # ["a", "b"], just as for attributes found in the document.
+            if self.builder.cdata_list_attributes:
+                attrs = self.builder._replace_cdata_list_attribute_values(
+                    tag.name, attrs
+                )
+            tag.attrs = attrs
+
+        # xformer goes last and sees the tag with its new name and attrs.
+        replacer.run_xformer(tag)
+
+        if tag.name != source_name:
+            # handle_endtag will be told the old name, so remember it.
+            self._renamed_tags[id(tag)] = source_name
+            # Tag.__init__ decided these from the old name; redo them.
+            tag.can_be_empty_element = self.builder.can_be_empty_element(tag.name)
+            if tag.name in self.builder.string_containers:
+                tag.interesting_string_types = {
+                    self.builder.string_containers[tag.name]
+                }
+            else:
+                tag.interesting_string_types = tag.MAIN_CONTENT_STRING_TYPES
+
     def handle_starttag(
         self,
         name: str,
@@ -1057,6 +1141,9 @@ class BeautifulSoup(Tag):
         )
         if tag is None:
             return tag
+        # Transform the tag now, before it is pushed onto the tag stack.
+        if self.replacer is not None:
+            self._apply_replacer(tag)
         if self._most_recent_element is not None:
             self._most_recent_element.next_element = tag
         self._most_recent_element = tag
@@ -1074,9 +1161,11 @@ class BeautifulSoup(Tag):
         # print("End tag: " + name)
         self.endData()
         if self.replacer is not None:
-            name = self.replacer.replace_name(name)
-
-        self._popToTag(name, nsprefix)
+            # `name` is the name used in the document, which may differ
+            # from the name the tag has in the tree.
+            self._popToSourceTag(name, nsprefix)
+        else:
+            self._popToTag(name, nsprefix) # M2
 
     def handle_data(self, data: str) -> None:
         """Called by the tree builder when a chunk of textual data is
