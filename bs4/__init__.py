@@ -518,6 +518,10 @@ class BeautifulSoup(Tag):
         clone.original_encoding = self.original_encoding
         return clone
 
+    def __iter__(self) -> Iterator[PageElement]:
+        """Iterate over every node in the document, one at a time. ..."""
+        return self.descendants
+
     def __getstate__(self) -> Dict[str, Any]:
         # Frequently a tree builder can't be pickled.
         d = dict(self.__dict__)
@@ -1119,8 +1123,8 @@ class BeautifulSoup(Tag):
         ):
             return None
 
-        if self.replacer is not None:
-            name = self.replacer.replace_name(name)
+        # if self.replacer is not None:
+        #     name = self.replacer.replace_name(name)
 
         tag_class = self.element_classes.get(Tag, Tag)
         # Assume that this is either Tag or a subclass of Tag. If not,
